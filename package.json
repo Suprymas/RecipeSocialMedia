@@ -3,11 +3,17 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
+    "postinstall": "npm install --prefix server",
+    "dev": "node scripts/dev.js",
+    "emulator": "node scripts/adb-reverse.js && node scripts/dev.js --localhost",
+    "server": "npm --prefix server start",
     "start": "expo start",
     "android": "expo start --android",
     "ios": "expo start --ios",
-    "web": "expo start --web",
-    "server": "npm --prefix server start"
+    "web": "expo start --web"
+  },
+  "engines": {
+    "node": ">=22.13"
   },
   "dependencies": {
     "@expo/ngrok": "^4.1.3",
