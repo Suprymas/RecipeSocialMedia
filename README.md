@@ -53,6 +53,8 @@ No email confirmation is needed.
 | `npm run emulator` | Forwards ports to the Android emulator, then backend + Expo |
 | `npm run server` | Backend only, with its log output |
 | `npm start` | Expo only |
+| `npm run complexity` | ESLint output with cyclomatic and cognitive complexity of every function |
+| `npm run complexity:table` | The same values as a sorted table (`-- --min 10` to hide simple functions) |
 
 ## Data
 
