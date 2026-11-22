@@ -1,10 +1,10 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { ScrollView, StyleSheet, TouchableOpacity, View, TextInput, Image, Alert } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
 import { ThemedText } from '../../components/ThemedText';
-import { backend, uploadImage } from '../../services/Backend';
+import { backend } from '../../services/Backend';
 import { Ionicons } from '@expo/vector-icons';
-import { useNavigation } from '@react-navigation/native';
+import { resolveAvatarUrl, saveErrorMessage, saveProfile } from './profileSave';
 
 export default function ProfileSettingsScreen({ navigation }) {
   const [user, setUser] = useState(null);
@@ -139,113 +139,38 @@ export default function ProfileSettingsScreen({ navigation }) {
     );
   };
 
+  // Validates, uploads a newly picked avatar, then creates or updates the profile
   const handleSave = async () => {
-    if (!username.trim()) {
+    const fields = { username: username.trim(), bio: bio.trim() };
+    if (!fields.username) {
       Alert.alert('Error', 'Username is required');
       return;
     }
 
+    setSaving(true);
     try {
-      setSaving(true);
       const { data: { user: authUser } } = await backend.auth.getUser();
-
       if (!authUser) {
         Alert.alert('Error', 'You must be logged in');
         return;
       }
 
-      let avatarUrl = user?.avatar_url || null;
+      const avatarUrl = await resolveAvatarUrl({
+        pickedUri: avatarUri,
+        savedUrl: user?.avatar_url,
+        userId: authUser.id,
+        onUploading: setUploadingAvatar,
+      });
+      const created = await saveProfile(authUser.id, { ...fields, avatar_url: avatarUrl });
 
-      // Upload new avatar if a local URI is set and it's different from the current one
-      // Don't block the entire save if avatar upload fails
-      if (avatarUri && avatarUri !== user?.avatar_url && !avatarUri.startsWith('http')) {
-        setUploadingAvatar(true);
-        try {
-          avatarUrl = await uploadImage(avatarUri, 'avatars', authUser.id);
-          console.log('Avatar uploaded successfully:', avatarUrl);
-        } catch (uploadError) {
-          console.error('Error uploading avatar:', uploadError);
-          // Don't return - allow saving other data even if avatar fails
-          Alert.alert(
-            'Warning', 
-            'Failed to upload avatar image, but other changes will be saved.',
-            [{ text: 'OK' }]
-          );
-          // Keep the existing avatar_url if upload fails
-          avatarUrl = user?.avatar_url || null;
-        }
-        setUploadingAvatar(false);
-      }
-
-      // Check if profile exists, if not create it first
-      const { data: existingProfile, error: checkError } = await backend
-        .from('profiles')
-        .select('id')
-        .eq('id', authUser.id)
-        .single();
-
-      if (checkError && checkError.code === 'PGRST116') {
-        // Profile doesn't exist, create it first
-        console.log('Profile does not exist, creating new profile...');
-        const { error: insertError } = await backend
-          .from('profiles')
-          .insert({
-            id: authUser.id,
-            username: username.trim(),
-            bio: bio.trim(),
-            avatar_url: avatarUrl,
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-          });
-
-        if (insertError) {
-          console.error('Error creating profile:', insertError);
-          throw insertError;
-        }
-
-        Alert.alert('Success', 'Profile created successfully!', [
-          { text: 'OK', onPress: () => navigation.goBack() },
-        ]);
-        return;
-      }
-
-      // Update existing profile
-      console.log('Updating profile for user:', authUser.id);
-      const { error: updateError } = await backend
-        .from('profiles')
-        .update({
-          username: username.trim(),
-          bio: bio.trim(),
-          avatar_url: avatarUrl,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', authUser.id);
-
-      if (updateError) {
-        console.error('Error updating profile:', updateError);
-        console.error('Error details:', JSON.stringify(updateError, null, 2));
-        throw updateError;
-      }
-
-      console.log('Profile updated successfully');
-      Alert.alert('Success', 'Profile updated successfully!', [
+      Alert.alert('Success', created ? 'Profile created successfully!' : 'Profile updated successfully!', [
         { text: 'OK', onPress: () => navigation.goBack() },
       ]);
     } catch (error) {
       console.error('Error saving profile:', error);
-      console.error('Error details:', JSON.stringify(error, null, 2));
-      
-      let errorMessage = 'Failed to update profile';
-      if (error.message) {
-        errorMessage += `: ${error.message}`;
-      } else if (error.code) {
-        errorMessage += ` (${error.code})`;
-      }
-      
-      Alert.alert('Error', errorMessage);
+      Alert.alert('Error', saveErrorMessage(error));
     } finally {
       setSaving(false);
-      setUploadingAvatar(false);
     }
   };
 
