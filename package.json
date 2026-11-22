@@ -17,11 +17,22 @@
     "coupling": "node metrics/coupling.cjs",
     "lint:sonarjs": "eslint --no-config-lookup -c metrics/static-analysis.config.js index.js App.js components screens services server/index.js",
     "lint:biome": "biome lint --config-path=metrics index.js App.js components screens services server/index.js",
+    "test": "npm run test:server && npm run test:app",
+    "test:server": "node -e \"require('fs').mkdirSync('coverage/server',{recursive:true})\" && node --test --test-force-exit --experimental-test-coverage --test-coverage-include=server/index.js --test-reporter=spec --test-reporter-destination=stdout --test-reporter=lcov --test-reporter-destination=coverage/server/lcov.info server/test/*.test.js",
+    "test:app": "jest --coverage",
+    "coverage": "node metrics/function-coverage.cjs",
     "sonar:start": "docker start sonarqube || docker run -d --name sonarqube -p 9000:9000 -e SONAR_ES_BOOTSTRAP_CHECKS_DISABLE=true sonarqube:community",
     "sonar": "docker run --rm -e SONAR_HOST_URL=http://host.docker.internal:9000 -e SONAR_TOKEN -v \"$PWD:/usr/src\" sonarsource/sonar-scanner-cli"
   },
   "engines": {
     "node": ">=22.13"
+  },
+  "jest": {
+    "preset": "jest-expo",
+    "testMatch": ["<rootDir>/__tests__/**/*.test.js"],
+    "coverageDirectory": "coverage/app",
+    "coverageReporters": ["text", "lcov"],
+    "coveragePathIgnorePatterns": ["/node_modules/", "/__tests__/"]
   },
   "dependencies": {
     "@expo/ngrok": "^4.1.3",
@@ -41,8 +52,12 @@
   "private": true,
   "devDependencies": {
     "@biomejs/biome": "2.3.0",
+    "@testing-library/react-native": "13.3.3",
     "eslint": "9.39.5",
     "eslint-plugin-sonarjs": "4.2.2",
-    "madge": "8.0.0"
+    "jest": "29.7.0",
+    "jest-expo": "54.0.18",
+    "madge": "8.0.0",
+    "react-test-renderer": "19.1.0"
   }
 }
