@@ -11,8 +11,12 @@
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web",
-    "complexity": "eslint --no-config-lookup -c metrics/complexity.config.js App.js screens services server/index.js",
+    "complexity": "eslint --no-config-lookup -c metrics/complexity.config.js index.js App.js components screens services server/index.js",
     "complexity:table": "node metrics/complexity-table.js",
+    "cohesion": "node metrics/measure-cohesion.cjs",
+    "coupling": "node metrics/coupling.cjs",
+    "lint:sonarjs": "eslint --no-config-lookup -c metrics/static-analysis.config.js index.js App.js components screens services server/index.js",
+    "lint:biome": "biome lint --config-path=metrics index.js App.js components screens services server/index.js",
     "sonar:start": "docker start sonarqube || docker run -d --name sonarqube -p 9000:9000 -e SONAR_ES_BOOTSTRAP_CHECKS_DISABLE=true sonarqube:community",
     "sonar": "docker run --rm -e SONAR_HOST_URL=http://host.docker.internal:9000 -e SONAR_TOKEN -v \"$PWD:/usr/src\" sonarsource/sonar-scanner-cli"
   },
@@ -36,7 +40,9 @@
   },
   "private": true,
   "devDependencies": {
+    "@biomejs/biome": "2.3.0",
     "eslint": "9.39.5",
-    "eslint-plugin-sonarjs": "4.2.2"
+    "eslint-plugin-sonarjs": "4.2.2",
+    "madge": "8.0.0"
   }
 }

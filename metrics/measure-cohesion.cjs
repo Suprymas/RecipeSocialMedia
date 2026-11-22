@@ -1,11 +1,16 @@
-
+// Cohesion of each file, in the spirit of Tight Class Cohesion (TCC):
+// the share of function pairs in a file that use at least one common outer variable.
+// 1 = every pair of functions shares state or dependencies, 0 = no pair does.
+//   node metrics/measure-cohesion.cjs [files or folders...]
 const fs = require("fs");
 const path = require("path");
 const parser = require("@babel/parser");
 const traverse = require("@babel/traverse").default;
 
 const root = process.cwd();
-const directories = ["screens", "components", "services"];
+const DEFAULT_TARGETS = ["App.js", "screens", "components", "services", "server/index.js"];
+const targets = process.argv.slice(2).length ? process.argv.slice(2) : DEFAULT_TARGETS;
+const SKIP_DIRS = new Set(["node_modules", "data"]);
 const results = [];
 
 function analyzeFile(file) {
@@ -76,23 +81,32 @@ function analyzeFile(file) {
 function scan(directory) {
   if (!fs.existsSync(directory)) return;
 
+  if (fs.statSync(directory).isFile()) {
+    analyze(directory);
+    return;
+  }
+
   for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
     const fullPath = path.join(directory, entry.name);
 
     if (entry.isDirectory()) {
-      scan(fullPath);
+      if (!SKIP_DIRS.has(entry.name)) scan(fullPath);
     } else if (/\.[jt]sx?$/.test(entry.name)) {
-      try {
-        const result = analyzeFile(fullPath);
-        if (result) results.push(result);
-      } catch (error) {
-        console.error(`Failed: ${fullPath}: ${error.message}`);
-      }
+      analyze(fullPath);
     }
   }
 }
 
-directories.forEach(dir => scan(path.join(root, dir)));
+function analyze(file) {
+  try {
+    const result = analyzeFile(file);
+    if (result) results.push(result);
+  } catch (error) {
+    console.error(`Failed: ${file}: ${error.message}`);
+  }
+}
+
+targets.forEach(target => scan(path.join(root, target)));
 
 results.sort((a, b) => a.cohesion - b.cohesion);
 

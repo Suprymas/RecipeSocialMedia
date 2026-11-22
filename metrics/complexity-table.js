@@ -5,7 +5,7 @@
 const path = require('node:path');
 const { ESLint } = require('eslint');
 
-const DEFAULT_FILES = ['App.js', 'screens', 'services', 'server/index.js'];
+const DEFAULT_FILES = ['index.js', 'App.js', 'components', 'screens', 'services', 'server/index.js'];
 
 const args = process.argv.slice(2);
 const minIndex = args.indexOf('--min');
