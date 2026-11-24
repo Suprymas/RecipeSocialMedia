@@ -277,28 +277,44 @@ const checkColumn = (table, column) => {
 const likeToGlob = (pattern) =>
   String(pattern).replace(/[*?[\]]/g, '[$&]').replace(/%/g, '*').replace(/_/g, '?');
 
+// SQLite has no boolean type: booleans are stored as 1 / 0
+const toSqlValue = (value) => (typeof value === 'boolean' ? Number(value) : value);
+
+// `is` filter values arrive as text ("true", "false") from the client
+const parseIsValue = (value) => {
+  if (value === 'true') return 1;
+  if (value === 'false') return 0;
+  return value;
+};
+
+// Filters that compare a column with one value
+const COMPARISONS = { eq: '=', neq: 'IS NOT', gt: '>', gte: '>=', lt: '<', lte: '<=', ilike: 'LIKE' };
+
+const isFilter = (col, value) => {
+  if (value === null || value === 'null') return { clause: `${col} IS NULL`, params: [] };
+  return { clause: `${col} IS ?`, params: [parseIsValue(value)] };
+};
+
+const inFilter = (col, value) => {
+  const list = Array.isArray(value) ? value : [];
+  if (list.length === 0) return { clause: '0', params: [] };
+  const placeholders = list.map(() => '?').join(', ');
+  return { clause: `${col} IN (${placeholders})`, params: list };
+};
+
+// Filters with their own SQL shape
+const SPECIAL_FILTERS = {
+  like: (col, value) => ({ clause: `${col} GLOB ?`, params: [likeToGlob(value)] }),
+  is: isFilter,
+  in: inFilter,
+};
+
 const condition = (table, { column, op, value }) => {
   const col = checkColumn(table, column);
-  const v = typeof value === 'boolean' ? (value ? 1 : 0) : value;
-  switch (op) {
-    case 'eq': return { clause: `${col} = ?`, params: [v] };
-    case 'neq': return { clause: `${col} IS NOT ?`, params: [v] };
-    case 'gt': return { clause: `${col} > ?`, params: [v] };
-    case 'gte': return { clause: `${col} >= ?`, params: [v] };
-    case 'lt': return { clause: `${col} < ?`, params: [v] };
-    case 'lte': return { clause: `${col} <= ?`, params: [v] };
-    case 'like': return { clause: `${col} GLOB ?`, params: [likeToGlob(v)] };
-    case 'ilike': return { clause: `${col} LIKE ?`, params: [v] };
-    case 'is':
-      if (v === null || v === 'null') return { clause: `${col} IS NULL`, params: [] };
-      return { clause: `${col} IS ?`, params: [v === 'true' ? 1 : v === 'false' ? 0 : v] };
-    case 'in': {
-      const list = Array.isArray(v) ? v : [];
-      if (list.length === 0) return { clause: '0', params: [] };
-      return { clause: `${col} IN (${list.map(() => '?').join(', ')})`, params: list };
-    }
-    default: throw new HttpError(400, `Unsupported filter "${op}"`);
-  }
+  const v = toSqlValue(value);
+  if (Object.hasOwn(COMPARISONS, op)) return { clause: `${col} ${COMPARISONS[op]} ?`, params: [v] };
+  if (Object.hasOwn(SPECIAL_FILTERS, op)) return SPECIAL_FILTERS[op](col, v);
+  throw new HttpError(400, `Unsupported filter "${op}"`);
 };
 
 // Filters are [{ column, op, value }] or { or: "col.op.value,col.op.value" }
@@ -325,94 +341,143 @@ const pickColumns = (row, columns = '*') => {
   return Object.fromEntries(cols.map((c) => [c, row[c] ?? null]));
 };
 
+// ---------- query actions ----------
+// Each action gets a context { table, uid, filters, now, writable } and returns the affected rows.
+
+const setClause = (column) => `${q(column)} = ?`;
+
+// Updates the row's non-id columns from already converted (toDb) data
+const updateRow = (table, id, data) => {
+  const cols = Object.keys(data).filter((c) => c !== 'id');
+  if (cols.length === 0) return;
+  sql.prepare(`UPDATE ${q(table)} SET ${cols.map(setClause).join(', ')} WHERE id = ?`)
+    .run(...cols.map((c) => data[c]), id);
+};
+
+const checkPayloadColumns = (table, obj) => {
+  for (const column of Object.keys(obj)) checkColumn(table, column);
+};
+
+const assertWritable = (ctx, ...rows) => {
+  if (!rows.every(ctx.writable)) throw rlsError(ctx.table);
+};
+
+const selectRows = (ctx, extra = '') => {
+  const { where, params } = buildWhere(ctx.table, ctx.filters, ctx.uid);
+  return sql.prepare(`SELECT * FROM ${q(ctx.table)}${where}${extra}`).all(...params)
+    .map((r) => fromDb(ctx.table, r));
+};
+
+const insertNewRow = (ctx, item) => {
+  const row = { id: crypto.randomUUID(), ...item };
+  assertWritable(ctx, row);
+  insertRow(ctx.table, row);
+  return getById(ctx.table, row.id);
+};
+
+const mergeIntoExisting = (ctx, existing, item) => {
+  const next = { ...existing, ...item, updated_at: ctx.now };
+  assertWritable(ctx, existing, next);
+  updateRow(ctx.table, existing.id, toDb(ctx.table, next));
+  return getById(ctx.table, existing.id);
+};
+
+// insert creates new rows only; upsert also merges into a row with the same id
+const writeItem = (ctx, item, action) => {
+  checkPayloadColumns(ctx.table, item);
+  const existing = item.id == null ? null : getById(ctx.table, item.id);
+  if (!existing) return insertNewRow(ctx, item);
+  if (action === 'insert') throw new HttpError(409, 'duplicate key value violates unique constraint', '23505');
+  return mergeIntoExisting(ctx, existing, item);
+};
+
+const runInsert = (ctx, { action, payload }) => {
+  const items = Array.isArray(payload) ? payload : [payload];
+  return transaction(() => items.map((item) => writeItem(ctx, item, action)));
+};
+
+const withUpdatedAt = (ctx, payload) =>
+  TABLES[ctx.table].includes('updated_at') ? { updated_at: ctx.now, ...payload } : payload;
+
+const runUpdate = (ctx, { payload }) => {
+  checkPayloadColumns(ctx.table, payload);
+  return transaction(() => {
+    const rows = selectRows(ctx).filter(ctx.writable);
+    const changes = withUpdatedAt(ctx, payload);
+    const data = toDb(ctx.table, changes);
+    return rows.map((r) => {
+      assertWritable(ctx, { ...r, ...changes, id: r.id });
+      updateRow(ctx.table, r.id, data);
+      return getById(ctx.table, r.id);
+    });
+  });
+};
+
+const runDelete = (ctx) => transaction(() => {
+  const rows = selectRows(ctx).filter(ctx.writable);
+  const del = sql.prepare(`DELETE FROM ${q(ctx.table)} WHERE id = ?`);
+  for (const r of rows) del.run(r.id);
+  return rows;
+});
+
+const sortDirection = (order) => (order.ascending === false ? 'DESC' : 'ASC');
+
+const orderClause = (table, orders) => {
+  if (orders.length === 0) return '';
+  const terms = orders.map((o) => `${checkColumn(table, o.column)} ${sortDirection(o)}`);
+  return ` ORDER BY ${terms.join(', ')}`;
+};
+
+const limitClause = (limit) => (Number.isInteger(limit) && limit >= 0 ? ` LIMIT ${limit}` : '');
+
+const runSelect = (ctx, { orders, limit }) =>
+  selectRows(ctx, orderClause(ctx.table, orders) + limitClause(limit));
+
+const WRITE_ACTIONS = new Map([
+  ['insert', runInsert],
+  ['upsert', runInsert],
+  ['update', runUpdate],
+  ['delete', runDelete],
+]);
+
+// ---------- query results ----------
+
+const compareRows = (a, b, orders) => {
+  for (const { column, ascending = true } of orders) {
+    if (a[column] !== b[column]) return (a[column] > b[column] ? 1 : -1) * (ascending ? 1 : -1);
+  }
+  return 0;
+};
+
+// Rare for writes; applied in JS to keep the write SQL simple
+const orderWrittenRows = (rows, { orders, limit }) => {
+  if (orders.length === 0 && limit == null) return rows;
+  const sorted = [...rows].sort((a, b) => compareRows(a, b, orders));
+  return limit == null ? sorted : sorted.slice(0, limit);
+};
+
+const singleRow = (rows, single) => {
+  if (rows.length === 1) return rows[0];
+  if (rows.length === 0 && single === 'maybe') return null;
+  throw new HttpError(406, `JSON object requested, ${rows.length} rows returned`, 'PGRST116');
+};
+
+const shapeResult = (rows, { columns, single }) => {
+  const picked = rows.map((r) => pickColumns(r, columns));
+  return single ? singleRow(picked, single) : picked;
+};
+
 const runQuery = (query, uid) => {
-  const { table, action = 'select', filters = [], orders = [], limit, single, returning, columns, payload } = query;
+  const { table, action = 'select', filters = [], orders = [], returning } = query;
   if (!TABLES[table]) throw new HttpError(404, `Unknown table "${table}"`);
-  const now = new Date().toISOString();
-  const writable = (r) => canWrite[table](r, uid);
-  const selectWhere = (extra = '') => {
-    const { where, params } = buildWhere(table, filters, uid);
-    return sql.prepare(`SELECT * FROM ${q(table)}${where}${extra}`).all(...params).map((r) => fromDb(table, r));
-  };
-  const checkPayloadColumns = (obj) => Object.keys(obj).forEach((c) => checkColumn(table, c));
-  let result;
+  const ctx = { table, uid, filters, now: new Date().toISOString(), writable: (r) => canWrite[table](r, uid) };
+  const options = { ...query, action, orders };
+  if (action === 'select') return shapeResult(runSelect(ctx, options), options);
 
-  if (action === 'insert' || action === 'upsert') {
-    const items = Array.isArray(payload) ? payload : [payload];
-    result = transaction(() => items.map((item) => {
-      checkPayloadColumns(item);
-      const existing = item.id != null ? getById(table, item.id) : null;
-      if (existing && action === 'insert') {
-        throw new HttpError(409, 'duplicate key value violates unique constraint', '23505');
-      }
-      if (existing) {
-        const next = { ...existing, ...item, updated_at: now };
-        if (!writable(existing) || !writable(next)) throw rlsError(table);
-        const data = toDb(table, next);
-        const cols = Object.keys(data).filter((c) => c !== 'id');
-        sql.prepare(`UPDATE ${q(table)} SET ${cols.map((c) => `${q(c)} = ?`).join(', ')} WHERE id = ?`)
-          .run(...cols.map((c) => data[c]), existing.id);
-        return getById(table, existing.id);
-      }
-      const row = { id: crypto.randomUUID(), ...item };
-      if (!writable(row)) throw rlsError(table);
-      insertRow(table, row);
-      return getById(table, row.id);
-    }));
-  } else if (action === 'update') {
-    checkPayloadColumns(payload);
-    result = transaction(() => {
-      const rows = selectWhere().filter(writable);
-      const changes = TABLES[table].includes('updated_at') ? { updated_at: now, ...payload } : payload;
-      const data = toDb(table, changes);
-      const cols = Object.keys(data).filter((c) => c !== 'id');
-      return rows.map((r) => {
-        if (!writable({ ...r, ...changes, id: r.id })) throw rlsError(table);
-        if (cols.length) {
-          sql.prepare(`UPDATE ${q(table)} SET ${cols.map((c) => `${q(c)} = ?`).join(', ')} WHERE id = ?`)
-            .run(...cols.map((c) => data[c]), r.id);
-        }
-        return getById(table, r.id);
-      });
-    });
-  } else if (action === 'delete') {
-    result = transaction(() => {
-      const rows = selectWhere().filter(writable);
-      const del = sql.prepare(`DELETE FROM ${q(table)} WHERE id = ?`);
-      rows.forEach((r) => del.run(r.id));
-      return rows;
-    });
-  } else {
-    const order = orders.length
-      ? ` ORDER BY ${orders.map((o) => `${checkColumn(table, o.column)} ${o.ascending === false ? 'DESC' : 'ASC'}`).join(', ')}`
-      : '';
-    const lim = Number.isInteger(limit) && limit >= 0 ? ` LIMIT ${limit}` : '';
-    result = selectWhere(order + lim);
-  }
-
-  if (action !== 'select' && !returning) return null;
-
-  if (action !== 'select') {
-    if (orders.length || limit != null) {
-      // Rare for writes; apply in JS to keep the SQL above simple
-      result = [...result].sort((a, b) => {
-        for (const { column, ascending = true } of orders) {
-          if (a[column] === b[column]) continue;
-          return (a[column] > b[column] ? 1 : -1) * (ascending ? 1 : -1);
-        }
-        return 0;
-      });
-      if (limit != null) result = result.slice(0, limit);
-    }
-  }
-  result = result.map((r) => pickColumns(r, columns));
-
-  if (single) {
-    if (result.length === 1) return result[0];
-    if (result.length === 0 && single === 'maybe') return null;
-    throw new HttpError(406, `JSON object requested, ${result.length} rows returned`, 'PGRST116');
-  }
-  return result;
+  // Unknown actions read like a select but are treated as writes below
+  const rows = (WRITE_ACTIONS.get(action) ?? runSelect)(ctx, options);
+  if (!returning) return null;
+  return shapeResult(orderWrittenRows(rows, options), options);
 };
 
 const rpcs = {
