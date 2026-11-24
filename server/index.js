@@ -573,67 +573,100 @@ const safeUploadPath = (rel) => {
   return full;
 };
 
-const handle = async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  const route = `${req.method} ${url.pathname}`;
-  const token = (req.headers.authorization ?? '').replace(/^Bearer /, '');
-  const requireUser = () => {
-    const user = userFromToken(token);
-    if (!user) throw new HttpError(401, 'Not signed in');
-    return user;
-  };
+const PREFLIGHT_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS',
+};
 
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-      'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS',
-    });
-    return res.end();
-  }
+const bearerToken = (req) => (req.headers.authorization ?? '').replace(/^Bearer /, '');
 
-  if (route === 'GET /health') return send(res, 200, { ok: true });
-  if (route === 'POST /auth/signup') return send(res, 200, signUp(await readJson(req)));
-  if (route === 'POST /auth/login') return send(res, 200, signIn(await readJson(req)));
-  if (route === 'GET /auth/user') return send(res, 200, { user: publicUser(requireUser()) });
-  if (route === 'POST /auth/logout') {
+const requireUser = (token) => {
+  const user = userFromToken(token);
+  if (!user) throw new HttpError(401, 'Not signed in');
+  return user;
+};
+
+// ---------- route handlers ----------
+// Each handler gets { req, res, url, token }.
+
+const handleRpc = async ({ req, res, url, token }) => {
+  requireUser(token);
+  const fn = rpcs[url.pathname.slice('/rpc/'.length)];
+  if (!fn) throw new HttpError(404, 'Unknown function');
+  return send(res, 200, { data: fn(await readJson(req)) });
+};
+
+// Files live under <bucket>/<path that contains the uploader's id>
+const isOwnFolder = (rel, userId) => rel.split('/').slice(1).includes(userId);
+
+const uploadFile = async ({ req, res, token }, { rel, file }) => {
+  const user = requireUser(token);
+  if (!isOwnFolder(rel, user.id)) throw new HttpError(403, 'You can only upload to your own folder');
+  const body = await readBody(req);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, body);
+  return send(res, 200, { path: rel });
+};
+
+const contentType = (file) => MIME[path.extname(file).slice(1).toLowerCase()] ?? 'application/octet-stream';
+
+const downloadFile = ({ res }, { file }) => {
+  if (!fs.existsSync(file)) throw new HttpError(404, 'Not found');
+  res.writeHead(200, {
+    'Content-Type': contentType(file),
+    'Cache-Control': 'public, max-age=3600',
+    'Access-Control-Allow-Origin': '*',
+  });
+  return fs.createReadStream(file).pipe(res);
+};
+
+const STORAGE_METHODS = { POST: uploadFile, PUT: uploadFile, GET: downloadFile };
+
+const handleStorage = (ctx) => {
+  const rel = decodeURIComponent(ctx.url.pathname.slice('/storage/'.length));
+  const file = safeUploadPath(rel);
+  const action = STORAGE_METHODS[ctx.req.method];
+  if (!action) throw new HttpError(404, 'Not found');
+  return action(ctx, { rel, file });
+};
+
+// ---------- routing ----------
+
+const ROUTES = new Map([
+  ['GET /health', ({ res }) => send(res, 200, { ok: true })],
+  ['POST /auth/signup', async ({ req, res }) => send(res, 200, signUp(await readJson(req)))],
+  ['POST /auth/login', async ({ req, res }) => send(res, 200, signIn(await readJson(req)))],
+  ['GET /auth/user', ({ res, token }) => send(res, 200, { user: publicUser(requireUser(token)) })],
+  ['POST /auth/logout', ({ res, token }) => {
     deleteSession(token);
     return send(res, 200, {});
-  }
-  if (route === 'POST /query') {
-    const user = requireUser();
+  }],
+  ['POST /query', async ({ req, res, token }) => {
+    const user = requireUser(token);
     return send(res, 200, { data: runQuery(await readJson(req), user.id) });
+  }],
+]);
+
+// Checked in order after the exact routes; a missing method matches any method
+const PREFIX_ROUTES = [
+  { method: 'POST', prefix: '/rpc/', handler: handleRpc },
+  { prefix: '/storage/', handler: handleStorage },
+];
+
+const findRoute = (method, pathname) =>
+  ROUTES.get(`${method} ${pathname}`)
+  ?? PREFIX_ROUTES.find((r) => (r.method ?? method) === method && pathname.startsWith(r.prefix))?.handler;
+
+const handle = async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, PREFLIGHT_HEADERS);
+    return res.end();
   }
-  if (req.method === 'POST' && url.pathname.startsWith('/rpc/')) {
-    requireUser();
-    const fn = rpcs[url.pathname.slice('/rpc/'.length)];
-    if (!fn) throw new HttpError(404, 'Unknown function');
-    return send(res, 200, { data: fn(await readJson(req)) });
-  }
-  if (url.pathname.startsWith('/storage/')) {
-    const rel = decodeURIComponent(url.pathname.slice('/storage/'.length));
-    const file = safeUploadPath(rel);
-    if (req.method === 'POST' || req.method === 'PUT') {
-      const user = requireUser();
-      // Files live under <bucket>/<path that starts with the uploader's id>
-      const [, ...rest] = rel.split('/');
-      if (!rest.join('/').split('/').includes(user.id)) throw new HttpError(403, 'You can only upload to your own folder');
-      const body = await readBody(req);
-      fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.writeFileSync(file, body);
-      return send(res, 200, { path: rel });
-    }
-    if (req.method === 'GET') {
-      if (!fs.existsSync(file)) throw new HttpError(404, 'Not found');
-      res.writeHead(200, {
-        'Content-Type': MIME[path.extname(file).slice(1).toLowerCase()] ?? 'application/octet-stream',
-        'Cache-Control': 'public, max-age=3600',
-        'Access-Control-Allow-Origin': '*',
-      });
-      return fs.createReadStream(file).pipe(res);
-    }
-  }
-  throw new HttpError(404, 'Not found');
+  const handler = findRoute(req.method, url.pathname);
+  if (!handler) throw new HttpError(404, 'Not found');
+  return handler({ req, res, url, token: bearerToken(req) });
 };
 
 const server = http.createServer((req, res) => {
